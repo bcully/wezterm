@@ -1688,7 +1688,7 @@ impl<'a> Performer<'a> {
         match action {
             Action::Print(c) => self.print(c),
             Action::Control(code) => self.control(code),
-            Action::DeviceControl(ctrl) => error!("Unhandled {:?}", ctrl),
+            Action::DeviceControl(ctrl) => self.host.handle_device_control(*ctrl),
             Action::OperatingSystemCommand(osc) => self.osc_dispatch(*osc),
             Action::Esc(esc) => self.esc_dispatch(esc),
             Action::CSI(csi) => self.csi_dispatch(csi),
