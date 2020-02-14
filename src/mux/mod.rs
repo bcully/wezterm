@@ -14,12 +14,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use term::TerminalHost;
+use termwiz::escape::DeviceControlMode;
 use thiserror::*;
 
 pub mod domain;
 pub mod renderable;
 pub mod tab;
+pub mod tmux;
 pub mod window;
+
+use tmux::TmuxDomain;
 
 #[derive(Clone, Debug)]
 pub enum MuxNotification {
@@ -37,6 +41,7 @@ pub struct Mux {
     domains: RefCell<HashMap<DomainId, Arc<dyn Domain>>>,
     domains_by_name: RefCell<HashMap<String, Arc<dyn Domain>>>,
     subscribers: RefCell<HashMap<usize, PollableSender<MuxNotification>>>,
+    tmux_domains: RefCell<HashMap<TabId, Arc<dyn Domain>>>,
 }
 
 fn read_from_tab_pty(tab_id: TabId, mut reader: Box<dyn std::io::Read>) {
@@ -68,10 +73,17 @@ fn read_from_tab_pty(tab_id: TabId, mut reader: Box<dyn std::io::Read>) {
                             promise::spawn::spawn_into_main_thread_with_low_priority(async move {
                                 let mux = Mux::get().unwrap();
                                 if let Some(tab) = mux.get_tab(tab_id) {
+                                    let domain = mux.tmux_domain_for_tab(tab_id);
+                                    let tmux_domain = domain
+                                        .as_ref()
+                                        .and_then(|domain| domain.downcast_ref::<TmuxDomain>());
+
                                     tab.advance_bytes(
                                         &data,
                                         &mut Host {
+                                            tab_id,
                                             writer: &mut *tab.writer(),
+                                            tmux_domain,
                                         },
                                     );
                                     mux.notify(MuxNotification::TabOutput(tab_id));
@@ -98,12 +110,72 @@ fn read_from_tab_pty(tab_id: TabId, mut reader: Box<dyn std::io::Read>) {
 /// As such it only really has Host::writer get called.
 /// The GUI driven flows provide their own impl of TerminalHost.
 struct Host<'a> {
+    tab_id: TabId,
     writer: &'a mut dyn std::io::Write,
+    tmux_domain: Option<&'a TmuxDomain>,
 }
 
 impl<'a> TerminalHost for Host<'a> {
     fn writer(&mut self) -> &mut dyn std::io::Write {
         &mut self.writer
+    }
+
+    fn handle_device_control(&mut self, control: DeviceControlMode) {
+        match control {
+            DeviceControlMode::Enter {
+                params,
+                intermediates,
+                ignored_extra_intermediates: false,
+            } => {
+                if params.len() == 1 && params[0] == 1000 && intermediates.is_empty() {
+                    log::error!("tmux -CC mode requested");
+
+                    // Create a new domain to host these tmux tabs
+                    let domain: Arc<dyn Domain> = Arc::new(TmuxDomain::new(self.tab_id));
+                    let mux = Mux::get().expect("to be called on main thread");
+                    mux.add_tmux_domain(self.tab_id, &domain);
+
+                    // TODO: do we need to proactively list available tabs here?
+                    // if so we should arrange to call domain.attach() and make
+                    // it do the right thing.
+                } else {
+                    log::error!(
+                        "unknown DeviceControlMode::Enter params={:?}, intermediates={:?}",
+                        params,
+                        intermediates
+                    );
+                }
+            }
+            DeviceControlMode::Data(c) => {
+                // This could simply lookup the tmux domain for each byte that
+                // passes through here, but that could be a lot for a large read,
+                // so we take on a bit of complexity to pre-cache the domain reference
+                // when we crate the Host instance so that we can do a slightly
+                // cheaper call here.
+                if let Some(tmux) = self.tmux_domain.as_ref() {
+                    tmux.advance(c);
+                } else {
+                    // If we're still processing the read in which we created the
+                    // tmux domain in the Enter case above, we'll need to look it
+                    // up each time here.
+                    let mux = Mux::get().expect("to be called on main thread");
+                    if let Some(domain) = mux.tmux_domain_for_tab(self.tab_id) {
+                        if let Some(tmux) = domain.downcast_ref::<TmuxDomain>() {
+                            tmux.advance(c);
+                        }
+                    } else {
+                        log::error!(
+                            "unhandled DeviceControlMode::Data {:x} {}",
+                            c,
+                            (c as char).escape_debug()
+                        );
+                    }
+                }
+            }
+            _ => {
+                log::error!("unhandled: {:?}", control);
+            }
+        }
     }
 }
 
@@ -131,6 +203,7 @@ impl Mux {
             domains_by_name: RefCell::new(domains_by_name),
             domains: RefCell::new(domains),
             subscribers: RefCell::new(HashMap::new()),
+            tmux_domains: RefCell::new(HashMap::new()),
         }
     }
 
@@ -164,6 +237,17 @@ impl Mux {
 
     pub fn get_domain_by_name(&self, name: &str) -> Option<Arc<dyn Domain>> {
         self.domains_by_name.borrow().get(name).cloned()
+    }
+
+    pub fn add_tmux_domain(&self, tab_id: TabId, domain: &Arc<dyn Domain>) {
+        self.tmux_domains
+            .borrow_mut()
+            .insert(tab_id, Arc::clone(domain));
+        self.add_domain(domain);
+    }
+
+    pub fn tmux_domain_for_tab(&self, tab_id: TabId) -> Option<Arc<dyn Domain>> {
+        self.tmux_domains.borrow().get(&tab_id).cloned()
     }
 
     pub fn add_domain(&self, domain: &Arc<dyn Domain>) {

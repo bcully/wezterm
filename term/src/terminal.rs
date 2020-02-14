@@ -1,6 +1,7 @@
 use super::*;
 use std::sync::Arc;
 use termwiz::escape::parser::Parser;
+use termwiz::escape::DeviceControlMode;
 
 pub trait Clipboard {
     fn get_contents(&self) -> anyhow::Result<String>;
@@ -23,6 +24,11 @@ pub trait TerminalHost {
     /// Returns an object that can be used to send data to the
     /// slave end of the associated pty.
     fn writer(&mut self) -> &mut dyn std::io::Write;
+
+    /// Process a device control sequence.
+    /// These are rather rare.
+    /// These are used by the `tmux -CC` protocol.
+    fn handle_device_control(&mut self, _control: DeviceControlMode) {}
 }
 
 pub struct Terminal {
