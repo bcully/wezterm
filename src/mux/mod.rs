@@ -122,6 +122,11 @@ impl<'a> TerminalHost for Host<'a> {
 
     fn handle_device_control(&mut self, control: DeviceControlMode) {
         match control {
+            DeviceControlMode::Exit => {
+                let mux = Mux::get().expect("to be called on main thread");
+                mux.exit_tmux_mode(self.tab_id);
+            }
+
             DeviceControlMode::Enter {
                 params,
                 intermediates,
@@ -129,15 +134,10 @@ impl<'a> TerminalHost for Host<'a> {
             } => {
                 if params.len() == 1 && params[0] == 1000 && intermediates.is_empty() {
                     log::error!("tmux -CC mode requested");
-
                     // Create a new domain to host these tmux tabs
                     let domain: Arc<dyn Domain> = Arc::new(TmuxDomain::new(self.tab_id));
                     let mux = Mux::get().expect("to be called on main thread");
                     mux.add_tmux_domain(self.tab_id, &domain);
-
-                // TODO: do we need to proactively list available tabs here?
-                // if so we should arrange to call domain.attach() and make
-                // it do the right thing.
                 } else {
                     log::error!(
                         "unknown DeviceControlMode::Enter params={:?}, intermediates={:?}",
@@ -237,6 +237,10 @@ impl Mux {
 
     pub fn get_domain_by_name(&self, name: &str) -> Option<Arc<dyn Domain>> {
         self.domains_by_name.borrow().get(name).cloned()
+    }
+
+    pub fn exit_tmux_mode(&self, tab_id: TabId) {
+        self.tmux_domains.borrow_mut().remove(&tab_id);
     }
 
     pub fn add_tmux_domain(&self, tab_id: TabId, domain: &Arc<dyn Domain>) {
