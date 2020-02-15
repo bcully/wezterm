@@ -135,9 +135,9 @@ impl<'a> TerminalHost for Host<'a> {
                     let mux = Mux::get().expect("to be called on main thread");
                     mux.add_tmux_domain(self.tab_id, &domain);
 
-                    // TODO: do we need to proactively list available tabs here?
-                    // if so we should arrange to call domain.attach() and make
-                    // it do the right thing.
+                // TODO: do we need to proactively list available tabs here?
+                // if so we should arrange to call domain.attach() and make
+                // it do the right thing.
                 } else {
                     log::error!(
                         "unknown DeviceControlMode::Enter params={:?}, intermediates={:?}",

@@ -6,12 +6,14 @@ use crate::mux::window::WindowId;
 use anyhow::bail;
 use async_trait::async_trait;
 use portable_pty::{CommandBuilder, PtySize};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 pub struct TmuxDomain {
     id: DomainId,
     #[allow(unused)]
     embedding_tab_id: TabId,
+    line_buffer: RefCell<Vec<u8>>,
 }
 
 impl TmuxDomain {
@@ -20,14 +22,32 @@ impl TmuxDomain {
         Self {
             id,
             embedding_tab_id,
+            line_buffer: RefCell::new(vec![]),
         }
     }
 
     /// process a byte sent by the remote tmux instance
     pub fn advance(&self, c: u8) {
-        log::error!("TmuxDomain advance {:x} {}", c, (c as char).escape_debug());
+        log::trace!("TmuxDomain advance {:x} {}", c, (c as char).escape_debug());
+        let mut line_buffer = self.line_buffer.borrow_mut();
 
-        // TODO: something useful with the data from tmux.
+        if c == b'\n' {
+            // We've got a line.
+            // Lines are usually (always?) CRLF terminated
+            if line_buffer.last() == Some(&b'\r') {
+                line_buffer.pop();
+            }
+
+            // TODO: something useful with this line
+            log::error!(
+                "TmuxDomain: {}",
+                String::from_utf8_lossy(&line_buffer).escape_debug()
+            );
+
+            line_buffer.clear();
+        } else {
+            line_buffer.push(c);
+        }
     }
 }
 
