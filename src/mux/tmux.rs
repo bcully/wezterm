@@ -130,7 +130,7 @@ enum Event {
     Output { window_id: u32, text: String },
 
     // events synthesize from command output
-    AddWindow { window_id: u32 },
+    AddWindow { window_id: u32, window_width: u32, window_height: u32 },
 
     // notifications we don't yet parse
     Unhandled
@@ -189,12 +189,13 @@ fn parse_notification(line: &str) -> anyhow::Result<Event> {
 
 impl TmuxCommand for ListWindowsCommand {
     fn command_string(&self) -> &str {
-        "list-windows -F '#{window_id}'"
+        "list-windows -F '#{window_id},#{window_width},#{window_height}'"
     }
 
     fn parse_line(&self, line: &str) -> anyhow::Result<Event> {
         // response is @window_id for some reason
-        Ok(Event::AddWindow { window_id: line[1..].parse()? })
+        let fields = line[1..].split(',').map(|field| field.parse()).collect::<Result<Vec<_>, _>>()?;
+        Ok(Event::AddWindow { window_id: fields[0], window_width: fields[1], window_height: fields[2] })
     }
 }
 
@@ -240,12 +241,18 @@ impl TmuxCommand for CapturePaneCommand {
 }
 
 struct TmuxTabRenderable {
-    control_tab: TabId
+    tab_id: TabId
 }
 
 impl TmuxTabRenderable {
-    fn new(control_tab: TabId) -> Self {
-        Self { control_tab }
+    fn new(tab_id: TabId) -> Self {
+        Self { tab_id }
+    }
+
+    fn get_tab(&self) -> Rc<TmuxTab> {
+        let mux = Mux::get().expect("tmux processing to be on main thread");
+        let tab = mux.tabs.borrow().get(&self.tab_id).unwrap().clone();
+        tab.downcast_rc::<TmuxTab>().unwrap_or_else(|_| panic!("not a tmux tab"))
     }
 }
 
@@ -263,16 +270,18 @@ impl Renderable for TmuxTabRenderable {
 
     fn get_lines(&mut self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
         log::error!("get_lines called for {:#?}", lines);
-        let mux = Mux::get().expect("tmux processing to be on main thread");
-        let domain = mux.tmux_domain_for_tab(self.control_tab).expect("to have a tmux domain");
-        let _tmux = domain.downcast_ref::<TmuxDomain>().expect("to have a tmux domain");
+        let _mux = Mux::get().expect("tmux processing to be on main thread");
+        // let domain = mux.tmux_domain_for_tab(self.tab_id).expect("to have a tmux domain");
+        // let _tmux = domain.downcast_ref::<TmuxDomain>().expect("to have a tmux domain");
 
         let rendered: Vec<Line> = (0..lines.len()).map(|_| Line::with_width(80)).collect();
         (lines.start, rendered)
     }
 
     fn get_dimensions(&self) -> RenderableDimensions {
-        RenderableDimensions { cols: 80, viewport_rows: 24, scrollback_rows: 0, physical_top: 0, scrollback_top: 0 }
+        let tmux_tab = self.get_tab();
+
+        RenderableDimensions { cols: tmux_tab.cols, viewport_rows: tmux_tab.rows, scrollback_rows: 0, physical_top: 0, scrollback_top: 0 }
     }
 }
 
@@ -286,15 +295,17 @@ struct TmuxTab {
     reader: Pipe,
     writer: RefCell<TmuxTabWriter>,
     renderable: RefCell<TmuxTabRenderable>,
+    rows: usize,
+    cols: usize,
     lines: RefCell<Vec<Line>>
 }
 
 impl TmuxTab {
-    fn new(domain_id: DomainId, control_tab: TabId, window_id: u32) -> Self {
+    fn new(domain_id: DomainId, control_tab: TabId, window_id: u32, window_width: u32, window_height: u32) -> Self {
         let reader = Pipe::new().expect("Pipe::new failed");
         let writer = RefCell::new(TmuxTabWriter { control_tab, window_id });
-        let renderable = RefCell::new(TmuxTabRenderable::new(control_tab));
         let tab_id = alloc_tab_id();
+        let renderable = RefCell::new(TmuxTabRenderable::new(tab_id));
 
         Self {
             domain_id,
@@ -305,6 +316,8 @@ impl TmuxTab {
             writer,
             renderable,
             lines: RefCell::new(vec![]),
+            rows: window_height as usize,
+            cols: window_width as usize,
         }
     }
 
@@ -512,17 +525,19 @@ impl TmuxDomain {
 
     fn handle_event(&self, event: Event) -> anyhow::Result<()> {
         match event {
-            Event::AddWindow { window_id } => self.add_window(window_id)?,
+            Event::AddWindow { window_id, window_width, window_height } =>
+                self.add_window(window_id, window_width, window_height)?,
             Event::Output { window_id, text } => self.send_output(window_id, &text)?,
             _ => log::error!("received event: {:?}", event)
         };
         Ok(())
     }
 
-    fn add_window(&self, window_id: u32) -> anyhow::Result<()> {
+    fn add_window(&self, window_id: u32, window_width: u32, window_height: u32) -> anyhow::Result<()> {
         log::error!("adding tab for tmux window {}", window_id);
         let mux = Mux::get().expect("to be called on main thread");
-        let tab: Rc<dyn Tab> = Rc::new(TmuxTab::new(self.id, self.embedding_tab_id, window_id));
+        let tmux_tab = TmuxTab::new(self.id, self.embedding_tab_id, window_id, window_width, window_height);
+        let tab: Rc<dyn Tab> = Rc::new(tmux_tab);
         mux.add_tab(&tab)?;
 
         self.tmux_window_to_tab.borrow_mut().insert(window_id, tab.tab_id());
